@@ -8,7 +8,7 @@ from pipnet.train import train_pipnet
 from pipnet.test import eval_pipnet, get_thresholds, eval_ood
 from util.eval_cub_csv import eval_prototypes_cub_parts_csv, get_topk_cub, get_proto_patches_cub
 import torch
-from util.vis_pipnet import visualize, visualize_topk
+from util.vis_pipnet import visualize, visualize_topk, visualize_both_stages
 from util.visualize_prediction import vis_pred, vis_pred_experiments
 import sys, os
 import random
@@ -123,13 +123,12 @@ def run_pipnet(args=None):
     scheduler_net = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_net, T_max=len(trainloader_pretraining)*args.epochs_pretrain, eta_min=args.lr_block/100., last_epoch=-1)
 
     # Forward one batch through the backbone to get the latent output size
-    with torch.no_grad():
-        xs1, _, _ = next(iter(trainloader))
-        xs1 = xs1.to(device)
-        proto_features, _, _ = net(xs1)
-        wshape = proto_features.shape[-1]
-        args.wshape = wshape #needed for calculating image patch size
-        print("Output shape: ", proto_features.shape, flush=True)
+    xs1, _, _ = next(iter(trainloader))
+    xs1 = xs1.to(device)
+    proto_features, _, _ = net(xs1)
+    wshape = proto_features.shape[-1]
+    args.wshape = wshape #needed for calculating image patch size
+    print("Output shape: ", proto_features.shape, flush=True)
     
     if net.module._num_classes == 2:
         # Create a csv log for storing the test accuracy, F1-score, mean train accuracy and mean loss for each epoch
@@ -141,19 +140,25 @@ def run_pipnet(args=None):
     
     
     lrs_pretrain_net = []
-    # PRETRAINING PROTOTYPES PHASE
+    # # PRETRAINING PROTOTYPES PHASE
     for epoch in range(1, args.epochs_pretrain+1):
-        for param in params_to_train:
-            param.requires_grad = True
-        for param in net.module._add_on.parameters():
-            param.requires_grad = True
-        for param in net.module._classification.parameters():
-            param.requires_grad = False
-        for param in params_to_freeze:
-            param.requires_grad = True # can be set to False when you want to freeze more layers
-        for param in params_backbone:
-            param.requires_grad = False #can be set to True when you want to train whole backbone (e.g. if dataset is very different from ImageNet)
+        # for param in params_to_train:
+        #     param.requires_grad = True
+        # for param in net.module._add_on.parameters():
+        #     param.requires_grad = True
+        # for param in net.module._classification.parameters():
+        #     param.requires_grad = False
+        # for param in params_to_freeze:
+        #     param.requires_grad = True # can be set to False when you want to freeze more layers
+        # for param in params_backbone:
+        #     param.requires_grad = False #can be set to True when you want to train whole backbone (e.g. if dataset is very different from ImageNet)
         
+        if args.num_features == 0:
+            for p in net.module._net.parameters():
+                p.requires_grad = True
+        else:
+            for p in net.module._net.parameters():
+                p.requires_grad = False
         print("\nPretrain Epoch", epoch, "with batch size", trainloader_pretraining.batch_size, flush=True)
         
         # Pretrain prototypes
@@ -170,7 +175,7 @@ def run_pipnet(args=None):
         net.train()
     with torch.no_grad():
         if 'convnext' in args.net and args.epochs_pretrain > 0:
-            topks = visualize_topk(net, projectloader, len(classes), device, 'visualised_pretrained_prototypes_topk', args)
+            topks = visualize_both_stages(net, projectloader, len(classes), device, 'visualised_pretrained_prototypes_topk', args, topk=True)
         
     # SECOND TRAINING PHASE
     # re-initialize optimizers and schedulers for second training phase
@@ -265,7 +270,25 @@ def run_pipnet(args=None):
     net.eval()
     torch.save({'model_state_dict': net.state_dict(), 'optimizer_net_state_dict': optimizer_net.state_dict(), 'optimizer_classifier_state_dict': optimizer_classifier.state_dict()}, os.path.join(os.path.join(args.log_dir, 'checkpoints'), 'net_trained_last'))
 
-    topks = visualize_topk(net, projectloader, len(classes), device, 'visualised_prototypes_topk', args)
+    topks = visualize_topk(
+        net,
+        projectloader,
+        len(classes),
+        device,
+        'visualised_prototypes_topk',
+        args,
+        branch="final"
+    )
+
+    visualize_topk(
+        net,
+        projectloader,
+        len(classes),
+        device,
+        'visualised_prototypes_topk',
+        args,
+        branch="stage3"
+    )    
     # set weights of prototypes that are never really found in projection set to 0
     set_to_zero = []
     if topks:
@@ -319,7 +342,14 @@ def run_pipnet(args=None):
         eval_prototypes_cub_parts_csv(csvfile_all, parts_loc_path, parts_name_path, imgs_id_path, 'test_all_thres'+str(cubthreshold)+'_'+str(epoch), args, log)
         
     # visualize predictions 
-    visualize(net, projectloader, len(classes), device, 'visualised_prototypes', args)
+    visualize_both_stages(
+    net,
+    projectloader,
+    len(classes),
+    device,
+    'visualised_prototypes',
+    args
+    )
     testset_img0_path = test_projectloader.dataset.samples[0][0]
     test_path = os.path.split(os.path.split(testset_img0_path)[0])[0]
     vis_pred(net, test_path, classes, device, args) 

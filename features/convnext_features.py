@@ -30,3 +30,44 @@ def convnext_tiny_13_features(pretrained=False, **kwargs):
         model = replace_convlayers_convnext(model, 300) 
     
     return model
+
+class ConvNextMultiStage(nn.Module):
+    def __init__(self, pretrained=True, threshold=300):
+        super().__init__()
+
+        base = models.convnext_tiny(
+            pretrained=pretrained,
+            weights=models.ConvNeXt_Tiny_Weights.DEFAULT
+        )
+
+        with torch.no_grad():
+            base.avgpool = nn.Identity()
+            base.classifier = nn.Identity()
+            base = replace_convlayers_convnext(base, threshold)
+
+        # IMPORTANT: use same attribute name as torchvision ConvNeXt
+        self.features = base.features
+        self.avgpool = base.avgpool
+        self.classifier = base.classifier
+
+    def forward(self, x, return_stage=None):
+        penultimate = None
+
+        for i, stage in enumerate(self.features):
+            x = stage(x)
+
+            if i == len(self.features) - 3:
+                penultimate = x
+
+        final = x
+
+        if return_stage == "penultimate":
+            return penultimate
+
+        if return_stage == "both":
+            return {
+                "penultimate": penultimate,
+                "final": final
+            }
+
+        return final
