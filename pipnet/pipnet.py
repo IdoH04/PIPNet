@@ -31,35 +31,18 @@ class PIPNet(nn.Module):
         self._classification = classification_layer
         self._multiplier = classification_layer.normalization_multiplier
 
+        #Stage 3 branch for explanations
         self.has_penultimate_branch = hasattr(args, "penultimate_channels")
 
         if self.has_penultimate_branch:
             pen_channels = args.penultimate_channels
-            pen_num_prototypes = getattr(args, "penultimate_num_features", 0)
 
-            if pen_num_prototypes == 0:
-                pen_num_prototypes = pen_channels
-                self.add_on_penultimate = nn.Sequential(
-                    nn.Softmax(dim=1)
-                )
-                print("Stage3 explanatory prototypes:", pen_num_prototypes, flush=True)
-            else:
-                self.add_on_penultimate = nn.Sequential(
-                    nn.Conv2d(
-                        in_channels=pen_channels,
-                        out_channels=pen_num_prototypes,
-                        kernel_size=1,
-                        stride=1,
-                        padding=0,
-                        bias=True
-                    ),
-                    nn.Softmax(dim=1)
-                )
-                print("Stage3 explanatory prototypes set from",
-                      pen_channels, "to", pen_num_prototypes,
-                      flush=True)
+            # Stage3 prototypes = softmax over stage3 feature channels.
+            self.add_on_penultimate = nn.Sequential(
+                nn.Softmax(dim=1)
+            )
 
-            self.penultimate_num_prototypes = pen_num_prototypes
+            self.penultimate_num_prototypes = pen_channels
 
             self.pool_penultimate = nn.Sequential(
                 nn.AdaptiveMaxPool2d(output_size=(1, 1)),
@@ -67,38 +50,40 @@ class PIPNet(nn.Module):
             )
 
             self.classifier_penultimate = NonNegLinear(
-                pen_num_prototypes,
+                pen_channels,
                 num_classes,
                 bias=args.bias
             )
 
-            # Freeze stage3 explanatory branch so it cannot affect training.
-            for p in self.add_on_penultimate.parameters():
-                p.requires_grad = False
-            for p in self.pool_penultimate.parameters():
-                p.requires_grad = False
+            # Dont train stage3 branch, only use for explanations
             for p in self.classifier_penultimate.parameters():
                 p.requires_grad = False
+
+            print("Stage3 explanatory prototypes:", pen_channels, flush=True)
+
         else:
             self.add_on_penultimate = None
             self.pool_penultimate = None
             self.classifier_penultimate = None
             self.penultimate_num_prototypes = 0
 
-       
-        self.proto_penultimate = None
-        self.pooled_penultimate = None
-        self.out_penultimate = None
-
-    def _compute_penultimate_for_visualization(self, stage3_features):
+    def _compute_penultimate_branch(self, stage3_features, train_stage3=False):
         if self.add_on_penultimate is None:
             return None, None, None
 
-        with torch.no_grad():
+        if train_stage3:
+            # Freeze backbone behavior, but allow classifier_penultimate gradients.
             stage3_features = stage3_features.detach()
             proto_pen = self.add_on_penultimate(stage3_features)
             pooled_pen = self.pool_penultimate(proto_pen)
             out_pen = self.classifier_penultimate(pooled_pen)
+        else:
+            # Visualization-only mode.
+            with torch.no_grad():
+                stage3_features = stage3_features.detach()
+                proto_pen = self.add_on_penultimate(stage3_features)
+                pooled_pen = self.pool_penultimate(proto_pen)
+                out_pen = self.classifier_penultimate(pooled_pen)
 
         self.proto_penultimate = proto_pen
         self.pooled_penultimate = pooled_pen
@@ -106,13 +91,13 @@ class PIPNet(nn.Module):
 
         return proto_pen, pooled_pen, out_pen
 
-    def forward(self, xs, inference=False, compute_penultimate=False):
-        if compute_penultimate or inference:
+    def forward(self, xs, inference=False, compute_penultimate=False, train_stage3=False):
+        if compute_penultimate or inference or train_stage3:
             stages = self._net(xs, return_stage="both")
             stage3_features = stages["penultimate"]
             final_features = stages["final"]
 
-            self._compute_penultimate_for_visualization(stage3_features)
+            self._compute_penultimate_branch(stage3_features, train_stage3=train_stage3)
         else:
             final_features = self._net(xs)
             self.proto_penultimate = None

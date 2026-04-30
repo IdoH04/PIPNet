@@ -1,6 +1,7 @@
 from pipnet.pipnet import PIPNet, get_network
 from util.log import Log
 import torch.nn as nn
+import torch.nn.functional as F
 from util.args import get_args, save_args, get_optimizer_nn
 from util.data import get_dataloaders
 from util.func import init_weights_xavier
@@ -16,6 +17,79 @@ import numpy as np
 from shutil import copy
 import matplotlib.pyplot as plt
 from copy import deepcopy
+
+def train_stage3_classifier_only(net, dataloader, device, args, num_epochs=5, lr=0.001):
+    print("\nTraining stage3 classifier only...", flush=True)
+
+    # Freeze everything.
+    for p in net.module.parameters():
+        p.requires_grad = False
+
+    # Train only stage3 classifier.
+    for p in net.module.classifier_penultimate.parameters():
+        p.requires_grad = True
+
+    optimizer_stage3 = torch.optim.Adam(
+        net.module.classifier_penultimate.parameters(),
+        lr=lr
+    )
+
+    criterion_stage3 = nn.NLLLoss(reduction='mean').to(device)
+
+    for epoch in range(1, num_epochs + 1):
+        net.train()
+        total_loss = 0.0
+        total_correct = 0
+        total_seen = 0
+
+        for batch in dataloader:
+            # Handles either:
+            #   trainloader: (xs1, xs2, ys)
+            #   projectloader/testloader: (xs, ys)
+            if len(batch) == 3:
+                xs, _, ys = batch
+            else:
+                xs, ys = batch
+
+            xs = xs.to(device)
+            ys = ys.to(device)
+
+            optimizer_stage3.zero_grad()
+
+            # Computes stage3 branch with gradients only through classifier_penultimate.
+            net(xs, train_stage3=True)
+
+            out_stage3 = net.module.out_penultimate
+            log_probs_stage3 = F.log_softmax(out_stage3, dim=1)
+
+            loss = criterion_stage3(log_probs_stage3, ys)
+
+            loss.backward()
+            optimizer_stage3.step()
+
+            total_loss += loss.item() * xs.shape[0]
+            preds = torch.argmax(out_stage3, dim=1)
+            total_correct += torch.sum(preds == ys).item()
+            total_seen += xs.shape[0]
+
+        mean_loss = total_loss / total_seen
+        acc = total_correct / total_seen
+
+        print(
+            "Stage3 Epoch",
+            epoch,
+            "loss:",
+            round(mean_loss, 4),
+            "acc:",
+            round(acc, 4),
+            flush=True
+        )
+
+    # Freeze it again after training, since it is only explanatory.
+    for p in net.module.classifier_penultimate.parameters():
+        p.requires_grad = False
+
+    print("Finished training stage3 classifier.", flush=True)
 
 def run_pipnet(args=None):
 
@@ -99,7 +173,11 @@ def run_pipnet(args=None):
                 pass
             if torch.mean(net.module._classification.weight).item() > 1.0 and torch.mean(net.module._classification.weight).item() < 3.0 and torch.count_nonzero(torch.relu(net.module._classification.weight-1e-5)).float().item() > 0.8*(num_prototypes*len(classes)): #assume that the linear classification layer is not yet trained (e.g. when loading a pretrained backbone only)
                 print("We assume that the classification layer is not yet trained. We re-initialize it...", flush=True)
-                torch.nn.init.normal_(net.module._classification.weight, mean=1.0,std=0.1) 
+                torch.nn.init.normal_(net.module._classification.weight, mean=1.0,std=0.1)
+                if net.module.classifier_penultimate is not None:
+                    torch.nn.init.normal_(net.module.classifier_penultimate.weight, mean=1.0, std=0.1)
+                    if args.bias:
+                        torch.nn.init.constant_(net.module.classifier_penultimate.bias, val=0.)
                 torch.nn.init.constant_(net.module._multiplier, val=2.)
                 print("Classification layer initialized with mean", torch.mean(net.module._classification.weight).item(), flush=True)
                 if args.bias:
@@ -269,6 +347,16 @@ def run_pipnet(args=None):
                 
     net.eval()
     torch.save({'model_state_dict': net.state_dict(), 'optimizer_net_state_dict': optimizer_net.state_dict(), 'optimizer_classifier_state_dict': optimizer_classifier.state_dict()}, os.path.join(os.path.join(args.log_dir, 'checkpoints'), 'net_trained_last'))
+
+    if hasattr(net.module, "classifier_penultimate") and net.module.classifier_penultimate is not None:
+        train_stage3_classifier_only(
+            net,
+            trainloader_normal,
+            device,
+            args,
+            num_epochs=5,
+            lr=0.001
+        )
 
     topks = visualize_topk(
         net,
