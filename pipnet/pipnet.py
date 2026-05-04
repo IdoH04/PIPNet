@@ -92,12 +92,29 @@ class PIPNet(nn.Module):
         return proto_pen, pooled_pen, out_pen
 
     def forward(self, xs, inference=False, compute_penultimate=False, train_stage3=False):
-        if compute_penultimate or inference or train_stage3:
+        if train_stage3:
+            if self.add_on_penultimate is None:
+                raise RuntimeError(
+                    "train_stage3=True was requested, but this PIPNet instance "
+                    "does not have a penultimate/stage3 branch."
+                )
+
+            with torch.no_grad():
+                stages = self._net(xs, return_stage="both")
+                stage3_features = stages["penultimate"]
+
+            proto_pen, pooled_pen, out_pen = self._compute_penultimate_branch(
+                stage3_features,
+                train_stage3=True
+            )
+            return proto_pen, pooled_pen, out_pen
+
+        if compute_penultimate or inference:
             stages = self._net(xs, return_stage="both")
             stage3_features = stages["penultimate"]
             final_features = stages["final"]
 
-            self._compute_penultimate_branch(stage3_features, train_stage3=train_stage3)
+            self._compute_penultimate_branch(stage3_features, train_stage3=False)
         else:
             final_features = self._net(xs)
             self.proto_penultimate = None
@@ -152,7 +169,6 @@ def _infer_feature_channels(features, args):
     if 'next' in args.net:
         features_name = str(args.net).upper()
 
-    # Important: explicitly ask multistage backbone for both stages
     if args.net == "convnext_tiny_multistage":
         was_training = features.training
         features.eval()
