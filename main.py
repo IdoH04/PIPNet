@@ -18,6 +18,49 @@ from shutil import copy
 import matplotlib.pyplot as plt
 from copy import deepcopy
 
+
+def set_stage3_gate_enabled(net, enabled):
+    """Turn Stage 3 -> Stage 4 gating on/off without changing command-line args."""
+    model = net.module if hasattr(net, "module") else net
+    if hasattr(model, "use_stage3_gating"):
+        model.use_stage3_gating = bool(enabled)
+
+
+def set_stage3_matrix_enabled(net, enabled):
+    """Turn Stage 3 -> Stage 4 matrix shaping on/off without changing command-line args."""
+    model = net.module if hasattr(net, "module") else net
+    if hasattr(model, "use_stage3_matrix_shaping"):
+        model.use_stage3_matrix_shaping = bool(enabled)
+
+
+def set_stage3_gate_trainable(net, trainable):
+    """Control whether the learned Stage 3 -> Stage 4 gate can update."""
+    model = net.module if hasattr(net, "module") else net
+    if hasattr(model, "stage3_to_final_gate") and model.stage3_to_final_gate is not None:
+        for p in model.stage3_to_final_gate.parameters():
+            p.requires_grad = bool(trainable)
+
+
+def set_stage3_matrix_trainable(net, trainable):
+    """Control whether the learned Stage 3 -> Stage 4 matrix can update."""
+    model = net.module if hasattr(net, "module") else net
+    if hasattr(model, "stage3_to_final_matrix") and model.stage3_to_final_matrix is not None:
+        for p in model.stage3_to_final_matrix.parameters():
+            p.requires_grad = bool(trainable)
+
+
+def set_stage3_additive_trainable(net, trainable):
+    model = net.module if hasattr(net, "module") else net
+
+    if hasattr(model, "classifier_penultimate") and model.classifier_penultimate is not None:
+        for p in model.classifier_penultimate.parameters():
+            p.requires_grad = bool(trainable)
+
+    if hasattr(model, "stage3_additive_alpha_logit"):
+        model.stage3_additive_alpha_logit.requires_grad = bool(trainable)
+
+
+
 def train_stage3_classifier_only(net, dataloader, device, args, num_epochs=5, lr=0.001):
     print("\nTraining stage3 classifier only...", flush=True)
 
@@ -204,6 +247,17 @@ def run_pipnet(args=None):
                     )
     net = net.to(device=device)
     net = nn.DataParallel(net, device_ids = device_ids)    
+
+    # Keep Stage 3 gating disabled during prototype pretraining. Pretraining should
+    # stay close to original PIP-Net and should not train the gate through tanh loss.
+    requested_stage3_gating = bool(getattr(args, 'use_stage3_gating', False))
+    requested_stage3_additive = bool(getattr(args, 'use_stage3_additive_evidence', False))
+    requested_stage3_matrix = bool(getattr(args, 'use_stage3_matrix_shaping', False))
+    set_stage3_gate_enabled(net, False)
+    set_stage3_matrix_enabled(net, False)
+    set_stage3_gate_trainable(net, False)
+    set_stage3_matrix_trainable(net, False)
+    set_stage3_additive_trainable(net, False)
     
     optimizer_net, optimizer_classifier, params_to_freeze, params_to_train, params_backbone = get_optimizer_nn(net, args)   
 
@@ -291,23 +345,24 @@ def run_pipnet(args=None):
     lrs_pretrain_net = []
     # # PRETRAINING PROTOTYPES PHASE
     for epoch in range(1, args.epochs_pretrain+1):
-        # for param in params_to_train:
-        #     param.requires_grad = True
-        # for param in net.module._add_on.parameters():
-        #     param.requires_grad = True
-        # for param in net.module._classification.parameters():
-        #     param.requires_grad = False
-        # for param in params_to_freeze:
-        #     param.requires_grad = True # can be set to False when you want to freeze more layers
-        # for param in params_backbone:
-        #     param.requires_grad = False #can be set to True when you want to train whole backbone (e.g. if dataset is very different from ImageNet)
-        
-        if args.num_features == 0:
-            for p in net.module._net.parameters():
-                p.requires_grad = True
-        else:
-            for p in net.module._net.parameters():
-                p.requires_grad = False
+        # Original PIP-Net freezing logic for prototype pretraining.
+        # Do not train the Stage 3 gate during pretraining.
+        set_stage3_gate_enabled(net, False)
+        set_stage3_matrix_enabled(net, False)
+        set_stage3_gate_trainable(net, False)
+        set_stage3_matrix_trainable(net, False)
+        set_stage3_additive_trainable(net, False)
+        for param in params_to_train:
+            param.requires_grad = True
+        for param in net.module._add_on.parameters():
+            param.requires_grad = True
+        for param in net.module._classification.parameters():
+            param.requires_grad = False
+        for param in params_to_freeze:
+            param.requires_grad = True # can be set to False when you want to freeze more layers
+        for param in params_backbone:
+            param.requires_grad = False #can be set to True when you want to train whole backbone (e.g. if dataset is very different from ImageNet)
+
         print("\nPretrain Epoch", epoch, "with batch size", trainloader_pretraining.batch_size, flush=True)
         
         # Pretrain prototypes
@@ -339,6 +394,10 @@ def run_pipnet(args=None):
                 topks = visualize_both_stages(net, projectloader, len(classes), device, 'visualised_pretrained_prototypes_topk', args, topk=True)
         
     # SECOND TRAINING PHASE
+    # Enable gated evidence for the supervised/classification phase only.
+    set_stage3_gate_enabled(net, requested_stage3_gating)
+    set_stage3_matrix_enabled(net, requested_stage3_matrix)
+
     # re-initialize optimizers and schedulers for second training phase
     optimizer_net, optimizer_classifier, params_to_freeze, params_to_train, params_backbone = get_optimizer_nn(net, args)            
     scheduler_net = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_net, T_max=len(trainloader)*args.epochs, eta_min=args.lr_net/100.)
@@ -351,6 +410,9 @@ def run_pipnet(args=None):
         param.requires_grad = False
     for param in net.module._classification.parameters():
         param.requires_grad = True
+    set_stage3_gate_trainable(net, False)
+    set_stage3_matrix_trainable(net, False)
+    set_stage3_additive_trainable(net, False)
     
     frozen = True
     lrs_net = []
@@ -367,6 +429,9 @@ def run_pipnet(args=None):
                 param.requires_grad = False
             for param in params_backbone:
                 param.requires_grad = False
+            set_stage3_gate_trainable(net, False)
+            set_stage3_matrix_trainable(net, False)
+            set_stage3_additive_trainable(net, False)
             finetune = True
         
         else: 
@@ -381,7 +446,9 @@ def run_pipnet(args=None):
                     for param in params_to_train:
                         param.requires_grad = True
                     for param in params_backbone:
-                        param.requires_grad = True   
+                        param.requires_grad = True
+                    set_stage3_gate_trainable(net, requested_stage3_gating)
+                    set_stage3_matrix_trainable(net, requested_stage3_matrix)
                     frozen = False
                 # freeze first layers of backbone, train rest
                 else:
@@ -393,6 +460,9 @@ def run_pipnet(args=None):
                         param.requires_grad = True
                     for param in params_backbone:
                         param.requires_grad = False
+                    set_stage3_gate_trainable(net, requested_stage3_gating)
+                    set_stage3_matrix_trainable(net, requested_stage3_matrix)
+                    set_stage3_additive_trainable(net, requested_stage3_additive)
         
         print("\n Epoch", epoch, "frozen:", frozen, flush=True)            
         if (epoch==args.epochs or epoch%30==0) and args.epochs>1:
@@ -442,7 +512,7 @@ def run_pipnet(args=None):
         k=10
     )
 
-    if hasattr(net.module, "classifier_penultimate") and net.module.classifier_penultimate is not None:
+    if (not getattr(args, "use_stage3_additive_evidence", False)) and (not getattr(args, "use_stage3_matrix_shaping", False)) and hasattr(net.module, "classifier_penultimate") and net.module.classifier_penultimate is not None:
         train_stage3_classifier_only(
             net,
             trainloader_normal,

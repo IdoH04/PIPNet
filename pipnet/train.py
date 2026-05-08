@@ -66,6 +66,14 @@ def train_pipnet(net, train_loader, optimizer_net, optimizer_classifier, schedul
         # Perform a forward pass through the network
         proto_features, pooled, out = net(torch.cat([xs1, xs2]))
         loss, acc = calculate_loss(proto_features, pooled, out, ys, align_pf_weight, t_weight, unif_weight, cl_weight, net.module._classification.normalization_multiplier, pretrain, finetune, criterion, train_iter, print=True, EPS=1e-8)
+
+        # Optional Stage 3 -> Stage 4 matrix shaping loss. This is computed inside
+        # PIPNet.forward and added only during the supervised phase.
+        matrix_loss = getattr(net.module, "stage3_matrix_shaping_loss", None)
+        if (not pretrain) and matrix_loss is not None:
+            matrix_weight = float(getattr(net.module, "stage3_matrix_loss_weight", 0.0))
+            if matrix_weight > 0.0:
+                loss = loss + matrix_weight * matrix_loss
         
         # Compute the gradient
         loss.backward()

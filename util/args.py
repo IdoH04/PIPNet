@@ -113,6 +113,74 @@ def get_args() -> argparse.Namespace:
                         action='store_true',
                         help='Flag that indicates whether to include a trainable bias in the linear classification layer.'
                         )
+    parser.add_argument('--use_stage3_gating',
+                        action='store_true',
+                        help='Use Stage 3 prototype presence scores to gate final Stage 4 prototype evidence. Requires --net convnext_tiny_multistage.'
+                        )
+    parser.add_argument('--stage3_gate_allow_backbone_grad',
+                        action='store_true',
+                        help='If set, gradients from the final gated classification loss may flow back through the Stage 3 branch. Default is safer: detach Stage 3 pooled scores before the gate.'
+                        )
+    parser.add_argument('--stage3_gate_bias',
+                        type=float,
+                        default=3.0,
+                        help='Initial bias for the Stage 3 -> Stage 4 gate. 3.0 gives sigmoid(3) ~= 0.95, close to identity.'
+                        )
+    parser.add_argument('--stage3_gate_lr_multiplier',
+                        type=float,
+                        default=1.0,
+                        help='Multiplier on lr_block for the Stage 3 -> Stage 4 gate optimizer group.'
+                        )
+
+    parser.add_argument('--use_stage3_additive_evidence',
+                        action='store_true',
+                        help='Add Stage 3 class evidence directly to the final Stage 4 class score. Requires --net convnext_tiny_multistage.'
+                        )
+    parser.add_argument('--stage3_additive_allow_backbone_grad',
+                        action='store_true',
+                        help='Allow gradients from the Stage 3 additive evidence term to flow into the Stage 3/backbone path. By default Stage 3 pooled scores are detached.'
+                        )
+    parser.add_argument('--stage3_additive_alpha',
+                        type=float,
+                        default=0.1,
+                        help='Scale alpha for additive Stage 3 evidence: out = out_final + alpha * out_stage3.'
+                        )
+    parser.add_argument('--stage3_additive_learnable_alpha',
+                        action='store_true',
+                        help='Make the Stage 3 additive-evidence scale alpha learnable via a sigmoid-constrained parameter.'
+                        )
+    parser.add_argument('--stage3_additive_lr_multiplier',
+                        type=float,
+                        default=1.0,
+                        help='Learning-rate multiplier for Stage 3 additive parameters, including classifier_penultimate and optional alpha.'
+                        )
+    parser.add_argument('--use_stage3_matrix_shaping',
+                        action='store_true',
+                        help='Use a learned Stage 3 -> Stage 4 matrix and shaping loss so final Stage 4 prototype scores are predictable from Stage 3 prototype scores.'
+                        )
+    parser.add_argument('--stage3_matrix_allow_backbone_grad',
+                        action='store_true',
+                        help='Allow the Stage 3 -> Stage 4 matrix shaping loss to flow into Stage 3/backbone features. Default detaches Stage 3 pooled scores.'
+                        )
+    parser.add_argument('--stage3_matrix_detach_final',
+                        action='store_true',
+                        help='Detach final Stage 4 pooled scores in the matrix shaping loss. This trains only the matrix predictor instead of shaping Stage 4 evidence.'
+                        )
+    parser.add_argument('--stage3_matrix_loss_weight',
+                        type=float,
+                        default=0.01,
+                        help='Weight for the Stage 3 -> Stage 4 matrix shaping loss added to the original PIP-Net loss.'
+                        )
+    parser.add_argument('--stage3_matrix_bias',
+                        type=float,
+                        default=-3.0,
+                        help='Initial bias for the Stage 3 -> Stage 4 matrix. 0.0 gives sigmoid(0)=0.5 initial predicted support.'
+                        )
+    parser.add_argument('--stage3_matrix_lr_multiplier',
+                        type=float,
+                        default=1.0,
+                        help='Learning-rate multiplier for the Stage 3 -> Stage 4 matrix parameters.'
+                        )
     parser.add_argument('--extra_test_image_folder',
                         type=str,
                         default='./experiments',
@@ -123,6 +191,31 @@ def get_args() -> argparse.Namespace:
         if not os.path.exists(args.log_dir):
             os.makedirs(args.log_dir)
 
+
+
+    if args.use_stage3_gating and args.net != 'convnext_tiny_multistage':
+        raise ValueError('--use_stage3_gating requires --net convnext_tiny_multistage')
+
+    if args.use_stage3_additive_evidence and args.net != 'convnext_tiny_multistage':
+        raise ValueError('--use_stage3_additive_evidence requires --net convnext_tiny_multistage')
+
+    if args.use_stage3_matrix_shaping and args.net != 'convnext_tiny_multistage':
+        raise ValueError('--use_stage3_matrix_shaping requires --net convnext_tiny_multistage')
+
+    if sum([
+        bool(args.use_stage3_gating),
+        bool(args.use_stage3_additive_evidence),
+        bool(args.use_stage3_matrix_shaping)
+    ]) > 1:
+        raise ValueError(
+            'Use only one Stage 3 attachment method at a time: gating, additive evidence, or matrix shaping.'
+        )
+
+    if args.stage3_additive_alpha < 0.0:
+        raise ValueError('--stage3_additive_alpha must be non-negative')
+
+    if args.stage3_matrix_loss_weight < 0.0:
+        raise ValueError('--stage3_matrix_loss_weight must be non-negative')
 
     return args
 
@@ -200,11 +293,56 @@ def get_optimizer_nn(net, args: argparse.Namespace) -> torch.optim.Optimizer:
             if args.bias:
                 classification_bias.append(param)
     
+    stage3_gate_params = []
+    if bool(getattr(args, 'use_stage3_gating', False)):
+        if hasattr(net.module, 'stage3_to_final_gate') and net.module.stage3_to_final_gate is not None:
+            stage3_gate_params = list(net.module.stage3_to_final_gate.parameters())
+        else:
+            raise ValueError('--use_stage3_gating requires a network with a Stage 3 branch, e.g. --net convnext_tiny_multistage')
+
+    stage3_matrix_params = []
+    if bool(getattr(args, 'use_stage3_matrix_shaping', False)):
+        if hasattr(net.module, 'stage3_to_final_matrix') and net.module.stage3_to_final_matrix is not None:
+            stage3_matrix_params = list(net.module.stage3_to_final_matrix.parameters())
+        else:
+            raise ValueError('--use_stage3_matrix_shaping requires a Stage 3 matrix branch')
+
+    stage3_additive_params = []
+    if bool(getattr(args, 'use_stage3_additive_evidence', False)):
+        if hasattr(net.module, 'classifier_penultimate') and net.module.classifier_penultimate is not None:
+            stage3_additive_params = list(net.module.classifier_penultimate.parameters())
+            if getattr(net.module, 'stage3_additive_learnable_alpha', False) and hasattr(net.module, 'stage3_additive_alpha_logit'):
+                stage3_additive_params.append(net.module.stage3_additive_alpha_logit)
+        else:
+            raise ValueError('--use_stage3_additive_evidence requires a Stage 3 classifier branch')
+
+
     paramlist_net = [
             {"params": params_backbone, "lr": args.lr_net, "weight_decay_rate": args.weight_decay},
             {"params": params_to_freeze, "lr": args.lr_block, "weight_decay_rate": args.weight_decay},
             {"params": params_to_train, "lr": args.lr_block, "weight_decay_rate": args.weight_decay},
             {"params": net.module._add_on.parameters(), "lr": args.lr_block*10., "weight_decay_rate": args.weight_decay}]
+
+    if stage3_gate_params:
+        paramlist_net.append({
+            "params": stage3_gate_params,
+            "lr": args.lr_block * args.stage3_gate_lr_multiplier,
+            "weight_decay_rate": args.weight_decay
+        })
+
+    if stage3_matrix_params:
+        paramlist_net.append({
+            "params": stage3_matrix_params,
+            "lr": args.lr_block * args.stage3_matrix_lr_multiplier,
+            "weight_decay_rate": args.weight_decay
+        })
+
+    if stage3_additive_params:
+        paramlist_net.append({
+            "params": stage3_additive_params,
+            "lr": args.lr_block * args.stage3_additive_lr_multiplier,
+            "weight_decay_rate": args.weight_decay
+        })
             
     paramlist_classifier = [
             {"params": classification_weight, "lr": args.lr, "weight_decay_rate": args.weight_decay},
