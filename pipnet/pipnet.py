@@ -80,6 +80,18 @@ class PIPNet(nn.Module):
         self.stage3_matrix_predicted_final = None
         self.stage3_matrix_shaping_loss = None
 
+        # Version A distribution-loss controls. The flag is enabled from args,
+        # but stage3_stage4_distribution_loss_active is kept False during
+        # pretraining and turned on in main.py only for supervised training.
+        self.use_stage3_stage4_distribution_loss = bool(getattr(args, "use_stage3_stage4_distribution_loss", False))
+        self.stage3_stage4_distribution_loss_active = False
+        self.stage3_stage4_distribution_loss_weight = float(getattr(args, "stage3_stage4_distribution_loss_weight", 0.05))
+        self.stage3_stage4_distribution_margin = float(getattr(args, "stage3_stage4_distribution_margin", 0.05))
+        self.stage3_stage4_distribution_include_stage3 = bool(getattr(args, "stage3_stage4_distribution_include_stage3", True))
+        self.stage3_stage4_distribution_include_stage4 = bool(getattr(args, "stage3_stage4_distribution_include_stage4", True))
+        self.stage3_stage4_distribution_normalize_parts = bool(getattr(args, "stage3_stage4_distribution_normalize_parts", True))
+        self.stage3_stage4_distribution_centroids = None
+
         #Stage 3 branch for explanations
         self.has_penultimate_branch = hasattr(args, "penultimate_channels")
 
@@ -133,6 +145,14 @@ class PIPNet(nn.Module):
                 print("Stage3 additive evidence enabled. alpha =", self.stage3_additive_alpha_init, "detach =", self.stage3_additive_detach, flush=True)
             if self.use_stage3_matrix_shaping:
                 print("Stage3 matrix shaping enabled. weight =", self.stage3_matrix_loss_weight, "stage3_detach =", self.stage3_matrix_detach, "final_detach =", self.stage3_matrix_detach_final, flush=True)
+            if self.use_stage3_stage4_distribution_loss:
+                print(
+                    "Stage3+Stage4 distribution loss enabled. weight =",
+                    self.stage3_stage4_distribution_loss_weight,
+                    "margin =",
+                    self.stage3_stage4_distribution_margin,
+                    flush=True
+                )
 
         else:
             self.add_on_penultimate = None
@@ -285,7 +305,13 @@ class PIPNet(nn.Module):
 
         # Only request both stages when needed. This keeps normal final-only PIP-Net
         # behavior intact unless Stage 3 visualization or Stage 3 gating is enabled.
-        need_stage3 = self.has_penultimate_branch and (compute_penultimate or self.use_stage3_gating or self.use_stage3_additive_evidence or self.use_stage3_matrix_shaping)
+        need_stage3 = self.has_penultimate_branch and (
+            compute_penultimate
+            or self.use_stage3_gating
+            or self.use_stage3_additive_evidence
+            or self.use_stage3_matrix_shaping
+            or (self.use_stage3_stage4_distribution_loss and self.stage3_stage4_distribution_loss_active)
+        )
 
         if need_stage3:
             stages = self._net(xs, return_stage="both")
@@ -294,7 +320,12 @@ class PIPNet(nn.Module):
 
             # For visualization-only calls, keep Stage 3 detached/no-grad.
             # For gating calls, allow gradients through the gate and optionally into Stage 3.
-            allow_stage3_grad = bool(self.use_stage3_gating or self.use_stage3_additive_evidence or self.use_stage3_matrix_shaping)
+            allow_stage3_grad = bool(
+                self.use_stage3_gating
+                or self.use_stage3_additive_evidence
+                or self.use_stage3_matrix_shaping
+                or (self.use_stage3_stage4_distribution_loss and self.stage3_stage4_distribution_loss_active)
+            )
             _, pooled_pen, _ = self._compute_penultimate_branch(
                 stage3_features,
                 train_stage3=False,

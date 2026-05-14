@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.optim
 import torch.utils.data
 import math
+from util.distribution_matching import distribution_loss_from_pooled
 
 def train_pipnet(net, train_loader, optimizer_net, optimizer_classifier, scheduler_net, scheduler_classifier, criterion, epoch, nr_epochs, device, pretrain=False, finetune=False, progress_prefix: str = 'Train Epoch'):
 
@@ -74,6 +75,28 @@ def train_pipnet(net, train_loader, optimizer_net, optimizer_classifier, schedul
             matrix_weight = float(getattr(net.module, "stage3_matrix_loss_weight", 0.0))
             if matrix_weight > 0.0:
                 loss = loss + matrix_weight * matrix_loss
+
+        # Version A: optional MCPNet-style Stage3+Stage4 distribution loss.
+        # This is only added during supervised training, never during prototype
+        # pretraining. main.py recomputes class centroids before each epoch.
+        if (not pretrain) and bool(getattr(net.module, "use_stage3_stage4_distribution_loss", False)) and bool(getattr(net.module, "stage3_stage4_distribution_loss_active", False)):
+            centroids = getattr(net.module, "stage3_stage4_distribution_centroids", None)
+            if centroids is not None:
+                pooled_stage3 = getattr(net.module, "pooled_penultimate", None)
+                labels_for_distribution = torch.cat([ys, ys])
+                dist_loss = distribution_loss_from_pooled(
+                    pooled_stage3=pooled_stage3,
+                    pooled_stage4=pooled,
+                    labels=labels_for_distribution,
+                    centroids=centroids,
+                    include_stage3=bool(getattr(net.module, "stage3_stage4_distribution_include_stage3", True)),
+                    include_stage4=bool(getattr(net.module, "stage3_stage4_distribution_include_stage4", True)),
+                    normalize_parts=bool(getattr(net.module, "stage3_stage4_distribution_normalize_parts", True)),
+                    margin=float(getattr(net.module, "stage3_stage4_distribution_margin", 0.05)),
+                )
+                dist_weight = float(getattr(net.module, "stage3_stage4_distribution_loss_weight", 0.0))
+                if dist_weight > 0.0:
+                    loss = loss + dist_weight * dist_loss
         
         # Compute the gradient
         loss.backward()

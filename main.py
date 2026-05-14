@@ -11,6 +11,7 @@ from util.eval_cub_csv import eval_prototypes_cub_parts_csv, get_topk_cub, get_p
 import torch
 from util.vis_pipnet import visualize, visualize_topk, visualize_both_stages
 from util.visualize_prediction import vis_pred, vis_pred_experiments
+from util.distribution_matching import compute_class_centroids
 import sys, os
 import random
 import numpy as np
@@ -31,6 +32,13 @@ def set_stage3_matrix_enabled(net, enabled):
     model = net.module if hasattr(net, "module") else net
     if hasattr(model, "use_stage3_matrix_shaping"):
         model.use_stage3_matrix_shaping = bool(enabled)
+
+
+def set_stage3_stage4_distribution_loss_active(net, active):
+    """Turn Version A distribution loss computation on/off."""
+    model = net.module if hasattr(net, "module") else net
+    if hasattr(model, "stage3_stage4_distribution_loss_active"):
+        model.stage3_stage4_distribution_loss_active = bool(active)
 
 
 def set_stage3_gate_trainable(net, trainable):
@@ -253,8 +261,10 @@ def run_pipnet(args=None):
     requested_stage3_gating = bool(getattr(args, 'use_stage3_gating', False))
     requested_stage3_additive = bool(getattr(args, 'use_stage3_additive_evidence', False))
     requested_stage3_matrix = bool(getattr(args, 'use_stage3_matrix_shaping', False))
+    requested_distribution_loss = bool(getattr(args, 'use_stage3_stage4_distribution_loss', False))
     set_stage3_gate_enabled(net, False)
     set_stage3_matrix_enabled(net, False)
+    set_stage3_stage4_distribution_loss_active(net, False)
     set_stage3_gate_trainable(net, False)
     set_stage3_matrix_trainable(net, False)
     set_stage3_additive_trainable(net, False)
@@ -349,6 +359,7 @@ def run_pipnet(args=None):
         # Do not train the Stage 3 gate during pretraining.
         set_stage3_gate_enabled(net, False)
         set_stage3_matrix_enabled(net, False)
+        set_stage3_stage4_distribution_loss_active(net, False)
         set_stage3_gate_trainable(net, False)
         set_stage3_matrix_trainable(net, False)
         set_stage3_additive_trainable(net, False)
@@ -397,15 +408,16 @@ def run_pipnet(args=None):
     # Enable gated evidence for the supervised/classification phase only.
     set_stage3_gate_enabled(net, requested_stage3_gating)
     set_stage3_matrix_enabled(net, requested_stage3_matrix)
+    set_stage3_stage4_distribution_loss_active(net, requested_distribution_loss)
 
     # re-initialize optimizers and schedulers for second training phase
     optimizer_net, optimizer_classifier, params_to_freeze, params_to_train, params_backbone = get_optimizer_nn(net, args)            
     scheduler_net = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_net, T_max=len(trainloader)*args.epochs, eta_min=args.lr_net/100.)
     # scheduler for the classification layer is with restarts, such that the model can re-active zeroed-out prototypes. Hence an intuitive choice. 
     if args.epochs<=30:
-        scheduler_classifier = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer_classifier, T_0=5, eta_min=0.001, T_mult=1, verbose=False)
+        scheduler_classifier = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer_classifier, T_0=5, eta_min=0.001, T_mult=1)
     else:
-        scheduler_classifier = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer_classifier, T_0=10, eta_min=0.001, T_mult=1, verbose=False)
+        scheduler_classifier = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer_classifier, T_0=10, eta_min=0.001, T_mult=1)
     for param in net.module.parameters():
         param.requires_grad = False
     for param in net.module._classification.parameters():
@@ -474,6 +486,27 @@ def run_pipnet(args=None):
                 if args.bias:
                     print("Classifier bias: ", net.module._classification.bias, flush=True)
                 torch.set_printoptions(profile="default")
+
+        if requested_distribution_loss:
+            # Version A: recompute class centroids once before each supervised epoch,
+            # matching MCPNet's idea of refreshing class-specific distributions.
+            was_training = net.training
+            net.eval()
+            centroid_loader = trainloader_normal if getattr(args, 'stage3_stage4_distribution_centroid_loader', 'train_normal') == 'train_normal' else projectloader
+            with torch.no_grad():
+                centroids = compute_class_centroids(
+                    net,
+                    centroid_loader,
+                    len(classes),
+                    device,
+                    include_stage3=bool(getattr(args, 'stage3_stage4_distribution_include_stage3', True)),
+                    include_stage4=bool(getattr(args, 'stage3_stage4_distribution_include_stage4', True)),
+                    normalize_parts=bool(getattr(args, 'stage3_stage4_distribution_normalize_parts', True)),
+                )
+            net.module.stage3_stage4_distribution_centroids = centroids.detach()
+            if was_training:
+                net.train()
+            print("Distribution centroids updated for epoch", epoch, "shape:", tuple(centroids.shape), flush=True)
 
         train_info = train_pipnet(net, trainloader, optimizer_net, optimizer_classifier, scheduler_net, scheduler_classifier, criterion, epoch, args.epochs, device, pretrain=False, finetune=finetune)
         lrs_net+=train_info['lrs_net']

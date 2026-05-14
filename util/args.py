@@ -181,6 +181,42 @@ def get_args() -> argparse.Namespace:
                         default=1.0,
                         help='Learning-rate multiplier for the Stage 3 -> Stage 4 matrix parameters.'
                         )
+
+    parser.add_argument('--use_stage3_stage4_distribution_loss',
+                        action='store_true',
+                        help='Version A: add a supervised MCPNet-style class-aware distribution loss on concat(Stage3 pooled, Stage4 pooled) during the main training phase only. Requires --net convnext_tiny_multistage.'
+                        )
+    parser.add_argument('--stage3_stage4_distribution_loss_weight',
+                        type=float,
+                        default=0.05,
+                        help='Weight for the Stage3+Stage4 class-aware distribution loss added to the original PIP-Net loss during supervised training.'
+                        )
+    parser.add_argument('--stage3_stage4_distribution_margin',
+                        type=float,
+                        default=0.05,
+                        help='JS-divergence hinge margin for pushing image distributions away from non-true class centroids.'
+                        )
+    parser.add_argument('--stage3_stage4_distribution_centroid_loader',
+                        type=str,
+                        default='train_normal',
+                        choices=['train_normal', 'project'],
+                        help='Dataloader used to recompute class centroids before each supervised epoch.'
+                        )
+    parser.add_argument('--stage3_stage4_distribution_include_stage3',
+                        action='store_true',
+                        default=True,
+                        help='Include Stage 3 pooled prototype scores in the trained distribution. Default: True.'
+                        )
+    parser.add_argument('--stage3_stage4_distribution_include_stage4',
+                        action='store_true',
+                        default=True,
+                        help='Include Stage 4 pooled prototype scores in the trained distribution. Default: True.'
+                        )
+    parser.add_argument('--stage3_stage4_distribution_normalize_parts',
+                        action='store_true',
+                        default=True,
+                        help='Normalize Stage 3 and Stage 4 parts separately before concatenating them. Default: True.'
+                        )
     parser.add_argument('--extra_test_image_folder',
                         type=str,
                         default='./experiments',
@@ -202,6 +238,10 @@ def get_args() -> argparse.Namespace:
     if args.use_stage3_matrix_shaping and args.net != 'convnext_tiny_multistage':
         raise ValueError('--use_stage3_matrix_shaping requires --net convnext_tiny_multistage')
 
+
+    if args.use_stage3_stage4_distribution_loss and args.net != 'convnext_tiny_multistage':
+        raise ValueError('--use_stage3_stage4_distribution_loss requires --net convnext_tiny_multistage')
+
     if sum([
         bool(args.use_stage3_gating),
         bool(args.use_stage3_additive_evidence),
@@ -216,6 +256,18 @@ def get_args() -> argparse.Namespace:
 
     if args.stage3_matrix_loss_weight < 0.0:
         raise ValueError('--stage3_matrix_loss_weight must be non-negative')
+
+
+    if args.stage3_stage4_distribution_loss_weight < 0.0:
+        raise ValueError('--stage3_stage4_distribution_loss_weight must be non-negative')
+
+    if args.stage3_stage4_distribution_margin < 0.0:
+        raise ValueError('--stage3_stage4_distribution_margin must be non-negative')
+
+    if args.use_stage3_stage4_distribution_loss and not (
+        args.stage3_stage4_distribution_include_stage3 or args.stage3_stage4_distribution_include_stage4
+    ):
+        raise ValueError('Distribution loss needs at least one of Stage 3 or Stage 4 enabled')
 
     return args
 
